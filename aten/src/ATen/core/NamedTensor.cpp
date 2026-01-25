@@ -1,33 +1,27 @@
+#define TORCH_ASSERT_NO_OPERATORS
 #include <ATen/core/NamedTensor.h>
 
-#include <ATen/core/Tensor.h>
-#include <c10/util/C++17.h>
+#include <ATen/core/TensorBase.h>
 
 namespace at {
 
-bool NamedTensorMeta::has_names() const {
-  return !std::all_of(
-      names_.begin(), names_.end(), [](const Dimname& n) {
-        return n.type() == NameType::WILDCARD;
-      });
-}
-
-thread_local bool NamesMode_enabled = true;
+thread_local static bool NamesMode_enabled = true;
 
 bool NamesMode::is_enabled() {
   return NamesMode_enabled;
 }
 
 void NamesMode::set_enabled(bool enabled) {
-   NamesMode_enabled = enabled;
+  NamesMode_enabled = enabled;
+  c10::impl::tls_set_dispatch_key_excluded(DispatchKey::Named, !enabled);
 }
 
-Tensor& internal_set_names_inplace(Tensor& tensor, optional<DimnameList> names) {
+const TensorBase& internal_set_names_inplace(const TensorBase& tensor, std::optional<DimnameList> names) {
   impl::internal_set_names_inplace(tensor.unsafeGetTensorImpl(), names, /*validate_names=*/true);
   return tensor;
 }
 
-Tensor& internal_set_names_inplace(Tensor& tensor, std::vector<Dimname>&& names, bool validate_names) {
+const TensorBase& internal_set_names_inplace(const TensorBase& tensor, std::vector<Dimname>&& names, bool validate_names) {
   impl::internal_set_names_inplace(tensor.unsafeGetTensorImpl(), std::move(names), validate_names);
   return tensor;
 }
@@ -54,11 +48,11 @@ static void check_unique_names(DimnameList names) {
   }
 }
 
-void check_names_valid_for(const Tensor& tensor, DimnameList names) {
-  return impl::check_names_valid_for(tensor.unsafeGetTensorImpl(), names);
+void check_names_valid_for(const TensorBase& tensor, DimnameList names) {
+  impl::check_names_valid_for(tensor.unsafeGetTensorImpl(), names);
 }
 
-void check_names_valid_for(int64_t tensor_dim, DimnameList names) {
+void check_names_valid_for(size_t tensor_dim, DimnameList names) {
   TORCH_CHECK(
       tensor_dim <= kMaxNamedTensorDim,
       "Named tensors only support up to ", kMaxNamedTensorDim, " dims: "
@@ -90,7 +84,11 @@ void check_names_valid_for(TensorImpl* impl, DimnameList names) {
   check_names_valid_for(impl->dim(), names);
 }
 
-void internal_set_names_inplace(TensorImpl* impl, optional<DimnameList> names, bool validate_names) {
+void internal_set_names_inplace(TensorImpl* impl, std::optional<DimnameList> names, bool validate_names) {
+  TORCH_CHECK(impl->layout() == Layout::Strided,
+      "NYI: named tensors only support strided layout");
+  TORCH_CHECK(impl->device().is_cpu() || impl->device().is_cuda() || impl->device().is_xpu() || impl->device().is_privateuseone(),
+      "NYI: named tensors only support CPU, CUDA, XPU or ", c10::get_privateuse1_backend(), " tensors.");
   if (!names) {
     impl->set_named_tensor_meta(nullptr);
     return;
@@ -98,11 +96,17 @@ void internal_set_names_inplace(TensorImpl* impl, optional<DimnameList> names, b
   if (validate_names) {
     check_names_valid_for(impl, *names);
   }
+  // Do this after validation!
+  if (std::all_of(names->begin(), names->end(), [](const Dimname& n) { return n.isWildcard(); })) {
+    impl->set_named_tensor_meta(nullptr);
+    return;
+  }
   auto* meta = get_named_tensor_meta(impl);
   if (meta == nullptr) {
-    impl->set_named_tensor_meta(std::make_unique<NamedTensorMeta>(*names));
+    // Constructor is private
+    impl->set_named_tensor_meta(std::make_unique<NamedTensorMeta>(NamedTensorMeta::HasNonWildcard, *names));
   } else {
-    meta->set_names(*names);
+    meta->set_names(NamedTensorMeta::HasNonWildcard, *names);
   }
 }
 
@@ -110,18 +114,23 @@ void internal_set_names_inplace(TensorImpl* impl, std::vector<Dimname>&& names, 
   if (validate_names) {
     check_names_valid_for(impl, names);
   }
+  // Do this after validation!
+  if (std::all_of(names.begin(), names.end(), [](const Dimname& n) { return n.isWildcard(); })) {
+    impl->set_named_tensor_meta(nullptr);
+    return;
+  }
   auto* meta = get_named_tensor_meta(impl);
   if (meta == nullptr) {
-    impl->set_named_tensor_meta(std::make_unique<NamedTensorMeta>(names));
+    impl->set_named_tensor_meta(std::make_unique<NamedTensorMeta>(NamedTensorMeta::HasNonWildcard, std::move(names)));
   } else {
-    meta->set_names(names);
+    meta->set_names(NamedTensorMeta::HasNonWildcard, std::move(names));
   }
 }
 
-optional<DimnameList> get_opt_names(const TensorImpl* impl) {
+std::optional<DimnameList> get_opt_names(const TensorImpl* impl) {
   const auto* meta = get_named_tensor_meta(impl);
   if (meta == nullptr) {
-    return nullopt;
+    return std::nullopt;
   } else {
     return meta->names();
   }
@@ -136,8 +145,7 @@ DimnameList get_names(const TensorImpl* impl) {
 }
 
 bool has_names(const TensorImpl* impl) {
-  const auto* named_tensor_meta = get_named_tensor_meta(impl);
-  return named_tensor_meta != nullptr && named_tensor_meta->has_names();
+  return impl->has_named_tensor_meta() && NamesMode::is_enabled();
 }
 
 } // namespace impl

@@ -1,9 +1,8 @@
 #pragma once
 
-#include <torch/csrc/jit/ir.h>
+#include <torch/csrc/jit/ir/ir.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 using ModulePtr = c10::intrusive_ptr<c10::ivalue::Object>;
 
@@ -14,9 +13,8 @@ using ModulePtr = c10::intrusive_ptr<c10::ivalue::Object>;
 // Returns a tuple (graph, parameters) where the last module.parameters.size()
 // inputs to the graph are the trainable parameters used in this method. The
 // remaining inputs are the true inputs to the function.
-TORCH_API std::pair<std::shared_ptr<Graph>, std::vector<at::Tensor>> LowerGraph(
+TORCH_API std::pair<std::shared_ptr<Graph>, std::vector<IValue>> LowerGraph(
     Graph& graph,
     const ModulePtr& self);
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

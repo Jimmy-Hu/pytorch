@@ -3,8 +3,8 @@
 #include <torch/types.h>
 #include <torch/utils.h>
 
-#include <torch/csrc/jit/export.h>
-#include <torch/csrc/jit/script/module.h>
+#include <torch/csrc/jit/api/module.h>
+#include <torch/csrc/jit/serialization/export.h>
 
 #include <c10/util/Exception.h>
 
@@ -12,9 +12,8 @@
 #include <ostream>
 #include <string>
 
-namespace torch {
-namespace serialize {
-OutputArchive::OutputArchive(std::shared_ptr<jit::script::CompilationUnit> cu)
+namespace torch::serialize {
+OutputArchive::OutputArchive(std::shared_ptr<jit::CompilationUnit> cu)
     : cu_(std::move(cu)),
       module_("__torch__.Module", cu_, /*shouldMangle=*/true) {}
 
@@ -47,5 +46,4 @@ void OutputArchive::save_to(
     const std::function<size_t(const void*, size_t)>& func) {
   jit::ExportModule(module_, func);
 }
-} // namespace serialize
-} // namespace torch
+} // namespace torch::serialize

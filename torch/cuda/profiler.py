@@ -1,21 +1,10 @@
-import ctypes
-import tempfile
+# mypy: allow-untyped-defs
 import contextlib
-from . import cudart, check_error
+
+from . import check_error, cudart
 
 
-class cudaOutputMode(object):
-    cudaKeyValuePair = ctypes.c_int(0)
-    cudaCSV = ctypes.c_int(1)
-
-    @staticmethod
-    def for_key(key):
-        if key == 'key_value':
-            return cudaOutputMode.cudaKeyValuePair
-        elif key == 'csv':
-            return cudaOutputMode.cudaCSV
-        else:
-            raise RuntimeError("supported CUDA profiler output modes are: key_value and csv")
+__all__ = ["start", "stop", "profile"]
 
 DEFAULT_FLAGS = [
     "gpustarttimestamp",
@@ -28,26 +17,38 @@ DEFAULT_FLAGS = [
 ]
 
 
-def init(output_file, flags=None, output_mode='key_value'):
-    flags = DEFAULT_FLAGS if flags is None else flags
-    output_mode = cudaOutputMode.for_key(output_mode)
-    with tempfile.NamedTemporaryFile(delete=True) as f:
-        f.write(b'\n'.join(map(lambda f: f.encode('ascii'), flags)))
-        f.flush()
-        check_error(cudart().cudaProfilerInitialize(
-            ctypes.c_char_p(f.name.encode('ascii')), ctypes.c_char_p(output_file.encode('ascii')), output_mode))
-
-
 def start():
+    r"""Starts cuda profiler data collection.
+
+    .. warning::
+        Raises CudaError in case of it is unable to start the profiler.
+    """
     check_error(cudart().cudaProfilerStart())
 
 
 def stop():
+    r"""Stops cuda profiler data collection.
+
+    .. warning::
+        Raises CudaError in case of it is unable to stop the profiler.
+    """
     check_error(cudart().cudaProfilerStop())
 
 
 @contextlib.contextmanager
 def profile():
+    """
+    Enable profiling.
+
+    Context Manager to enabling profile collection by the active profiling tool from CUDA backend.
+    Example:
+        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
+        >>> import torch
+        >>> model = torch.nn.Linear(20, 30).cuda()
+        >>> inputs = torch.randn(128, 20).cuda()
+        >>> with torch.cuda.profiler.profile() as prof:
+        ...     model(inputs)
+    """
     try:
         start()
         yield

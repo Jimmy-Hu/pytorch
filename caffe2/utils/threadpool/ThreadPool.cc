@@ -1,53 +1,83 @@
 #include "caffe2/utils/threadpool/ThreadPool.h"
 #include "WorkersPool.h"
-#include "caffe2/core/logging.h"
 
+#if !defined(__s390x__) && !defined(__powerpc__)
 #include <cpuinfo.h>
+#else
+#include <thread>
+#endif
 
 C10_DEFINE_bool(
     caffe2_threadpool_force_inline,
     false,
-    "Force to always run jobs on the calling thread");
+    "Force to always run jobs on the calling thread")
 
 // Whether or not threadpool caps apply to Android
-C10_DEFINE_int(caffe2_threadpool_android_cap, true, "");
+C10_DEFINE_int(caffe2_threadpool_android_cap, true, "")
 
-// Whether or not threadpool caps apply to iOS
-C10_DEFINE_int(caffe2_threadpool_ios_cap, true, "");
+// Whether or not threadpool caps apply to iOS and MacOS
+C10_DEFINE_int(caffe2_threadpool_ios_cap, true, "")
+C10_DEFINE_int(caffe2_threadpool_macos_cap, true, "")
+
+C10_DEFINE_int(pthreadpool_size, 0, "Override the default thread pool size.")
 
 namespace caffe2 {
 
-// Default smallest amount of work that will be partitioned between
-// multiple threads; the runtime value is configurable
-constexpr size_t kDefaultMinWorkSize = 1;
+namespace {
+  class ThreadPoolImpl : public ThreadPool {
+  public:
+    explicit ThreadPoolImpl(int numThreads);
+    ~ThreadPoolImpl() override;
 
-std::unique_ptr<ThreadPool> ThreadPool::defaultThreadPool() {
-  CAFFE_ENFORCE(cpuinfo_initialize(), "cpuinfo initialization failed");
-  int numThreads = cpuinfo_get_processors_count();
+    // Returns the number of threads currently in use
+    int getNumThreads() const override;
+    void setNumThreads(size_t numThreads) override;
+
+    void run(const std::function<void(int, size_t)>& fn, size_t range) override;
+    void withPool(const std::function<void(WorkersPool*)>& f) override;
+
+  private:
+    std::atomic_size_t numThreads_;
+    std::shared_ptr<WorkersPool> workersPool_;
+    std::vector<std::shared_ptr<Task>> tasks_;
+  };
+}
+
+size_t getDefaultNumThreads() {
+#if !defined(__s390x__) && !defined(__powerpc__)
+  auto numThreads = 1U;
+  if (cpuinfo_initialize()) {
+    numThreads = std::max(cpuinfo_get_processors_count(), 1U);
+  } else {
+    LOG(WARNING) << "cpuinfo initialization failed";
+    numThreads = std::max(std::thread::hardware_concurrency(), 1U);
+  }
 
   bool applyCap = false;
-#if C10_ANDROID
+#if defined(C10_ANDROID)
   applyCap = FLAGS_caffe2_threadpool_android_cap;
-#elif C10_IOS
+#elif defined(C10_IOS)
   applyCap = FLAGS_caffe2_threadpool_ios_cap;
+#elif defined(TARGET_OS_MAC)
+  applyCap = FLAGS_caffe2_threadpool_macos_cap;
 #endif
 
   if (applyCap) {
     switch (numThreads) {
-#if C10_ANDROID && (CPUINFO_ARCH_ARM || CPUINFO_ARCH_ARM64)
+#if defined(C10_ANDROID) && (CPUINFO_ARCH_ARM || CPUINFO_ARCH_ARM64)
       case 4:
-          switch (cpuinfo_get_core(0)->midr & UINT32_C(0xFF00FFF0)) {
-            case UINT32_C(0x51002110): /* Snapdragon 820 Kryo Silver */
-            case UINT32_C(0x51002010): /* Snapdragon 821 Kryo Silver */
-            case UINT32_C(0x51002050): /* Snapdragon 820/821 Kryo Gold */
-              /* Kryo: 2+2 big.LITTLE */
-              numThreads = 2;
-              break;
-            default:
-              /* Anything else: assume homogeneous architecture */
-              numThreads = 4;
-              break;
-          }
+        switch (cpuinfo_get_core(0)->midr & UINT32_C(0xFF00FFF0)) {
+          case UINT32_C(0x51002110): /* Snapdragon 820 Kryo Silver */
+          case UINT32_C(0x51002010): /* Snapdragon 821 Kryo Silver */
+          case UINT32_C(0x51002050): /* Snapdragon 820/821 Kryo Gold */
+            /* Kryo: 2+2 big.LITTLE */
+            numThreads = 2;
+            break;
+          default:
+            /* Anything else: assume homogeneous architecture */
+            numThreads = 4;
+            break;
+        }
         break;
 #endif
       case 5:
@@ -58,6 +88,7 @@ std::unique_ptr<ThreadPool> ThreadPool::defaultThreadPool() {
         /* 2+4 big.LITTLE */
         numThreads = 2;
         break;
+      // NOLINTNEXTLINE(cppcoreguidelines-avoid-magic-numbers,bugprone-branch-clone)
       case 8:
         /* 4+4 big.LITTLE */
         numThreads = 4;
@@ -73,34 +104,70 @@ std::unique_ptr<ThreadPool> ThreadPool::defaultThreadPool() {
         break;
     }
   }
-  LOG(INFO) << "Constructing thread pool with " << numThreads << " threads";
-  return std::make_unique<ThreadPool>(numThreads);
+#else
+  auto numThreads = std::max(std::thread::hardware_concurrency(), 1U);
+#endif
+
+  if (FLAGS_pthreadpool_size) {
+    // Always give precedence to explicit setting.
+    numThreads = FLAGS_pthreadpool_size;
+  }
+
+  /*
+   * For llvm-tsan, holding limit for the number of locks for a single thread
+   * is 63 (because of comparison < 64 instead of <=). pthreadpool's worst
+   * case is the number of threads in a pool. So we want to limit the threadpool
+   * size to 64 when running with tsan. However, sometimes it is tricky to
+   * detect if we are running under tsan, for now capping the default
+   * threadcount to the tsan limit unconditionally.
+   */
+  auto tsanThreadLimit = 63U;
+  numThreads = std::min(numThreads, tsanThreadLimit);
+
+  return numThreads;
 }
 
-ThreadPool::ThreadPool(int numThreads)
-    : minWorkSize_(kDefaultMinWorkSize), numThreads_(numThreads),
-      workersPool_(std::make_shared<WorkersPool>()) {}
+// Default smallest amount of work that will be partitioned between
+// multiple threads; the runtime value is configurable
+constexpr size_t kDefaultMinWorkSize = 1;
 
-ThreadPool::~ThreadPool() {}
+size_t ThreadPool::defaultNumThreads_ = 0;
 
-int ThreadPool::getNumThreads() const {
+ThreadPool* ThreadPool::createThreadPool(int numThreads) {
+  return new ThreadPoolImpl(numThreads);
+}
+
+std::unique_ptr<ThreadPool> ThreadPool::defaultThreadPool() {
+  defaultNumThreads_ = getDefaultNumThreads();
+  LOG(INFO) << "Constructing thread pool with " << defaultNumThreads_
+            << " threads";
+  return std::make_unique<ThreadPoolImpl>(defaultNumThreads_);
+}
+
+ThreadPoolImpl::ThreadPoolImpl(int numThreads)
+    : numThreads_(numThreads),
+      workersPool_(std::make_shared<WorkersPool>()) {
+  minWorkSize_ = kDefaultMinWorkSize;
+}
+
+// NOLINTNEXTLINE(modernize-use-equals-default)
+ThreadPoolImpl::~ThreadPoolImpl() {}
+
+int ThreadPoolImpl::getNumThreads() const {
   return numThreads_;
 }
 
-void ThreadPool::setNumThreads(size_t numThreads) {
-  numThreads_ = numThreads;
+// Sets the number of threads
+// # of threads should not be bigger than the number of big cores
+void ThreadPoolImpl::setNumThreads(size_t numThreads) {
+  if (defaultNumThreads_ == 0) {
+    defaultNumThreads_ = getDefaultNumThreads();
+  }
+  numThreads_ = std::min(numThreads, defaultNumThreads_);
 }
 
-// Sets the minimum work size (range) for which to invoke the
-// threadpool; work sizes smaller than this will just be run on the
-// main (calling) thread
-void ThreadPool::setMinWorkSize(size_t size) {
-  std::lock_guard<std::mutex> guard(executionMutex_);
-  minWorkSize_ = size;
-}
-
-void ThreadPool::run(const std::function<void(int, size_t)>& fn, size_t range) {
-  const auto numThreads = numThreads_.load(std::memory_order_relaxed); 
+void ThreadPoolImpl::run(const std::function<void(int, size_t)>& fn, size_t range) {
+  const auto numThreads = numThreads_.load(std::memory_order_relaxed);
 
   std::lock_guard<std::mutex> guard(executionMutex_);
   // If there are no worker threads, or if the range is too small (too
@@ -117,12 +184,10 @@ void ThreadPool::run(const std::function<void(int, size_t)>& fn, size_t range) {
   }
 
   struct FnTask : public Task {
-    FnTask(){};
-    ~FnTask() override{};
-    const std::function<void(int, size_t)> *fn_;
-    int idx_;
-    size_t start_;
-    size_t end_;
+    const std::function<void(int, size_t)>* fn_{};
+    int idx_{};
+    size_t start_{};
+    size_t end_{};
     void Run() override {
       for (auto i = start_; i < end_; ++i) {
         (*fn_)(idx_, i);
@@ -135,9 +200,10 @@ void ThreadPool::run(const std::function<void(int, size_t)>& fn, size_t range) {
   tasks_.resize(numThreads);
   for (size_t i = 0; i < numThreads; ++i) {
     if (!tasks_[i]) {
+      // NOLINTNEXTLINE(modernize-make-shared)
       tasks_[i].reset(new FnTask());
     }
-    auto *task = (FnTask *)tasks_[i].get();
+    auto* task = (FnTask*)tasks_[i].get();
     task->fn_ = &fn;
     task->idx_ = i;
     task->start_ = std::min<size_t>(range, i * unitsPerTask);
@@ -154,7 +220,7 @@ void ThreadPool::run(const std::function<void(int, size_t)>& fn, size_t range) {
   workersPool_->Execute(tasks_);
 }
 
-void ThreadPool::withPool(const std::function<void(WorkersPool*)>& f) {
+void ThreadPoolImpl::withPool(const std::function<void(WorkersPool*)>& f) {
   std::lock_guard<std::mutex> guard(executionMutex_);
   f(workersPool_.get());
 }

@@ -1,6 +1,19 @@
-try:
-    from tensorboard.summary.writer.record_writer import RecordWriter  # noqa F401
-except ImportError:
-    raise ImportError('TensorBoard logging requires TensorBoard with Python summary writer installed. '
-                      'This should be available in 1.14 or above.')
-from .writer import FileWriter, SummaryWriter  # noqa F401
+import tensorboard
+from torch._vendor.packaging.version import Version
+
+if not hasattr(tensorboard, "__version__") or Version(
+    tensorboard.__version__
+) < Version("1.15"):
+    raise ImportError("TensorBoard logging requires TensorBoard version 1.15 or above")
+
+del Version
+del tensorboard
+
+from .writer import FileWriter, SummaryWriter
+from tensorboard.summary.writer.record_writer import RecordWriter
+
+__all__ = [
+    "FileWriter",
+    "RecordWriter",
+    "SummaryWriter",
+]

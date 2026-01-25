@@ -6,13 +6,10 @@
  */
 
 #include <ATen/core/function_schema.h>
-#include <c10/util/C++17.h>
 #include <c10/util/Metaprogramming.h>
 
 namespace c10 {
-namespace detail {
-
-namespace infer_schema {
+namespace detail::infer_schema {
 
 /// The templated inference code creates `ArgumentDef` instead of `Argument`,
 /// because that can be constructed at compile time and has a much smaller
@@ -22,6 +19,9 @@ namespace infer_schema {
 struct ArgumentDef final {
   using GetTypeFn = TypePtr();
   GetTypeFn* getTypeFn;
+  GetTypeFn* getFakeTypeFn;
+  constexpr ArgumentDef(): getTypeFn(nullptr), getFakeTypeFn(nullptr) {}
+  explicit constexpr ArgumentDef(GetTypeFn *getTypeFn, GetTypeFn *getFakeTypeFn): getTypeFn(getTypeFn), getFakeTypeFn(getFakeTypeFn) {}
 };
 
 template<bool V>
@@ -34,23 +34,24 @@ template <class... Types>
 constexpr int checkStaticTypes() {
  // Give nice error messages for some of the common error cases.
  // Use a LOUD ERROR MESSAGE SO USERS SEE THE STATIC_ASSERT
- static_assert(guts::conjunction<
-     bool_t<!std::is_integral<Types>::value || std::is_same<Types, int64_t>::value || std::is_same<Types, bool>::value>...
-   >::value, "INVALID TYPE: Only int64_t and bool are supported as an integral argument type");
- static_assert(guts::conjunction<
-     bool_t<!std::is_same<Types, float>::value>...
-   >::value, "INVALID TYPE: float is not supported as an argument type, use double instead");
+ static_assert(std::conjunction_v<
+     bool_t<!std::is_integral_v<Types> || std::is_same_v<Types, int8_t> || std::is_same_v<Types, int64_t> || std::is_same_v<Types, bool>>...
+   >, "INVALID TYPE: Only int8_t, int64_t and bool are supported as an integral argument type");
+ static_assert(std::conjunction_v<
+     bool_t<!std::is_same_v<Types, float>>...
+   >, "INVALID TYPE: float is not supported as an argument type, use double instead");
  return 0;
 }
 
 template <typename... Ts, size_t... Is>
-constexpr std::array<ArgumentDef, sizeof...(Ts)> createArgumentVectorFromTypes(std::index_sequence<Is...>) {
+constexpr std::array<ArgumentDef, sizeof...(Ts)> createArgumentVectorFromTypes(std::index_sequence<Is...> /*unused*/) {
   return (
     // Check types for common errors
     checkStaticTypes<Ts...>(),
 
     // Create the return value
-    std::array<ArgumentDef, sizeof...(Ts)>{{ArgumentDef{&getTypePtr_<std::decay_t<Ts>>::call}...}}
+    std::array<ArgumentDef, sizeof...(Ts)>{
+      ArgumentDef(&getTypePtrCopy<std::decay_t<Ts>>, &getFakeTypePtrCopy<std::decay_t<Ts>>)...}
   );
 }
 
@@ -84,7 +85,7 @@ struct createReturns<std::tuple<ReturnTypes...>, void> final {
 };
 
 template<class ReturnType>
-struct createReturns<ReturnType, std::enable_if_t<!std::is_same<void, ReturnType>::value && !guts::is_instantiation_of<std::tuple, ReturnType>::value>> final {
+struct createReturns<ReturnType, std::enable_if_t<!std::is_same_v<void, ReturnType> && !guts::is_instantiation_of<std::tuple, ReturnType>::value>> final {
   static constexpr std::array<ArgumentDef, 1> call() {
     return createReturns<std::tuple<ReturnType>>::call();
   }
@@ -97,48 +98,60 @@ struct createReturns<void, void> final {
   }
 };
 
-template<size_t NumArgs>
-std::vector<Argument> createArgumentVector(const std::array<ArgumentDef, NumArgs>& args) {
-  std::vector<Argument> result;
-  result.reserve(NumArgs);
-  for (size_t i = 0; i < args.size(); ++i) {
-    // Arguments are named "_<index>"
-    result.push_back(Argument("_" + c10::guts::to_string(i), (*args[i].getTypeFn)()));
+template <typename ReturnType>
+struct createSingleReturn {
+  static constexpr std::array<ArgumentDef, 1> call() {
+    return createArgumentVectorFromTypes<ReturnType>(std::make_index_sequence<1>());
   }
-  return result;
-}
+};
 
-// This is intentionally a separate function
-// because then the template is smaller and that benefits binary size
-inline FunctionSchema make_function_schema(std::string&& name, std::string&& overload_name, std::vector<Argument>&& arguments, std::vector<Argument>&& returns) {
-  return FunctionSchema(std::move(name), std::move(overload_name), std::move(arguments), std::move(returns));
-}
-
-template<size_t NumArgs, size_t NumReturns>
-inline FunctionSchema make_function_schema(std::string&& name, std::string&& overload_name, const std::array<ArgumentDef, NumArgs>& arguments, const std::array<ArgumentDef, NumReturns>& returns) {
-  return make_function_schema(std::move(name), std::move(overload_name), createArgumentVector(arguments), createArgumentVector(returns));
-}
+TORCH_API FunctionSchema make_function_schema(std::string&& name, std::string&& overload_name, c10::ArrayRef<ArgumentDef> arguments, c10::ArrayRef<ArgumentDef> returns);
+TORCH_API FunctionSchema make_function_schema(c10::ArrayRef<ArgumentDef> arguments, c10::ArrayRef<ArgumentDef> returns);
 
 /// Creates a `FunctionSchema` object from a `FunctionTraits` type for a
-/// function.
+/// function. Flattens std::tuple returns into multiple return types
 template <typename FunctionTraits>
-FunctionSchema createFunctionSchemaFromTraits(std::string&& name, std::string&& overload_name) {
+FunctionSchema createFunctionSchemaFromTraitsFlattenedReturns() {
  using ReturnType = typename FunctionTraits::return_type;
  using ParameterTypes = typename FunctionTraits::parameter_types;
 
+ // arguments and returns are computed into a std::array at compile time and embedded into the binary.
+ // The only code executed at runtime here is the one that creates a std::vector
+ // of the arguments/returns from the std::array.
  constexpr auto arguments = createArguments<ParameterTypes>::call();
  constexpr auto returns = createReturns<ReturnType>::call();
 
+ return make_function_schema(arguments, returns);
+}
+
+/// Creates a `FunctionSchema` object from a `FunctionTraits` type for a
+/// function. Preserves std::tuple returns as a Tuple return type
+template <typename FunctionTraits>
+FunctionSchema createFunctionSchemaFromTraitsSingleReturn(std::string&& name, std::string&& overload_name) {
+ using ReturnType = typename FunctionTraits::return_type;
+ using ParameterTypes = typename FunctionTraits::parameter_types;
+
+ // arguments and returns are computed into a std::array at compile time and embedded into the binary.
+ // The only code executed at runtime here is the one that creates a std::vector
+ // of the arguments/returns from the std::array.
+ constexpr auto arguments = createArguments<ParameterTypes>::call();
+ constexpr auto returns = createSingleReturn<ReturnType>::call();
+
  return make_function_schema(std::move(name), std::move(overload_name), arguments, returns);
 }
-}
+
 }
 
 template<class FuncType>
-FunctionSchema inferFunctionSchema(std::string&& name, std::string&& overload_name) {
-  return detail::infer_schema::createFunctionSchemaFromTraits<guts::infer_function_traits_t<FuncType>>(std::move(name), std::move(overload_name));
+FunctionSchema inferFunctionSchemaFlattenedReturns() {
+  return detail::infer_schema::createFunctionSchemaFromTraitsFlattenedReturns<guts::infer_function_traits_t<FuncType>>();
 }
 
-CAFFE2_API c10::optional<std::string> findSchemaDifferences(const FunctionSchema& inferred, const FunctionSchema& specified);
+template<class FuncType>
+FunctionSchema inferFunctionSchemaSingleReturn(std::string&& name, std::string&& overload_name) {
+  return detail::infer_schema::createFunctionSchemaFromTraitsSingleReturn<guts::infer_function_traits_t<FuncType>>(std::move(name), std::move(overload_name));
+}
+
+TORCH_API std::optional<std::string> findSchemaDifferences(const FunctionSchema& inferred, const FunctionSchema& specified);
 
 }

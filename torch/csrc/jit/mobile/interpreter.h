@@ -1,33 +1,26 @@
 #pragma once
-#include <ATen/core/ivalue.h>
-#include <ATen/core/operator_name.h>
-#include <torch/csrc/jit/instruction.h>
-#include <ATen/core/dispatch/Dispatcher.h>
 
-namespace torch{
-namespace jit{
-namespace mobile {
-using Stack = std::vector<c10::IValue>;
-using VarargFuncton = std::function<void(int, Stack&)>;
-struct Code {
-  std::vector<Instruction> instructions_;
-  std::vector<c10::OperatorName> op_names_;
-  std::vector<c10::optional<c10::OperatorHandle>> operators_;
-  std::vector<VarargFuncton> vararg_operators_;
-  std::vector<c10::IValue> constants_;
-  size_t register_size_; // Aggregated output size.
-};
+#include <vector>
+
+#include <torch/csrc/jit/mobile/code.h>
+#include <torch/csrc/jit/mobile/frame.h>
+
+namespace torch::jit::mobile {
 
 struct InterpreterState {
-  TORCH_API explicit InterpreterState(std::shared_ptr<Code> code);
+  TORCH_API explicit InterpreterState(const Code& code);
   TORCH_API bool run(Stack& stack);
 
  private:
-  std::shared_ptr<Code> code_;
+  void enterFrame(const Code& /*code*/);
+  void leaveFrame();
+  void saveExceptionDebugHandles();
+  void callFunction(torch::jit::Function& f, Stack& stack);
+
   c10::IValue& reg(size_t reg);
   std::vector<c10::IValue> registers_;
+  std::vector<Frame> frames_;
 };
 
-} // namespace mobile
-} // namespace torch
-} // namespace jit
+const std::vector<DebugHandle>& getInterpretersExceptionDebugHandles();
+} // namespace torch::jit::mobile

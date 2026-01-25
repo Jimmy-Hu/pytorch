@@ -1,26 +1,27 @@
 #pragma once
 
 #include <c10/macros/Macros.h>
+#include <c10/macros/Export.h>
 #include <c10/util/TypeTraits.h>
 #include <c10/util/TypeList.h>
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/order_preserving_flat_hash_map.h>
-#include <c10/util/Optional.h>
+#include <optional>
 #include <ATen/core/TensorBody.h>
+#include <ATen/core/jit_type_base.h>
 
 namespace c10 {
 struct IValue;
 template<class Key, class Value> class Dict;
 struct Type;
-using TypePtr = std::shared_ptr<Type>;
 
 namespace impl {
-bool shallowEquals(const IValue& lhs, const IValue& rhs);
 
 using valid_dict_key_types = guts::typelist::typelist<
   int64_t,
   std::string,
   double,
+  c10::complex<double>,
   bool,
   at::Tensor
 >;
@@ -33,9 +34,7 @@ struct DictKeyHash {
 };
 
 struct DictKeyEqualTo {
-  bool operator()(const IValue& lhs, const IValue& rhs) const {
-    return impl::shallowEquals(lhs, rhs);
-  }
+  bool operator()(const IValue& lhs, const IValue& rhs) const;
 };
 
 struct DictImpl final : public c10::intrusive_ptr_target {
@@ -53,6 +52,7 @@ struct DictImpl final : public c10::intrusive_ptr_target {
   DictElementTypes elementTypes;
 
   intrusive_ptr<DictImpl> copy() const;
+  friend TORCH_API bool operator==(const DictImpl& lhs, const DictImpl& rhs);
 };
 
 }
@@ -70,19 +70,20 @@ public:
   explicit DictEntryRef(Iterator iterator)
   : iterator_(std::move(iterator)) {}
 
-  Key key() const {
+  decltype(auto) key() const {
     return iterator_->first.template to<Key>();
   }
 
-  Value value() const {
+  decltype(auto) value() const {
     return iterator_->second.template to<Value>();
   }
 
   template<class Value_>
   void setValue(Value_&& value) const {
-    static_assert(std::is_constructible<Value, Value_>::value, "Wrong type for the value argument of setValue()");
+    static_assert(std::is_constructible_v<Value, Value_>, "Wrong type for the value argument of setValue()");
     iterator_->second = Value(std::forward<Value_>(value));
   }
+  ~DictEntryRef() = default;
 
 private:
   // allow copying and moving, but only our friends (i.e. the Dict class) can do
@@ -101,17 +102,21 @@ private:
 // this wraps map_type::iterator to make sure user code can't rely
 // on it being the type of the underlying map.
 template<class Key, class Value, class Iterator>
-class DictIterator final : public std::iterator<std::forward_iterator_tag, DictEntryRef<Key, Value, Iterator>> {
+class DictIterator final {
 public:
+   // C++17 friendly std::iterator implementation
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = DictEntryRef<Key, Value, Iterator>;
+  using difference_type = std::ptrdiff_t;
+  using pointer = value_type*;
+  using reference = value_type&;
+
   explicit DictIterator() = default;
   ~DictIterator() = default;
 
   DictIterator(const DictIterator& rhs): entryRef_(rhs.entryRef_) {}
   DictIterator(DictIterator&& rhs) noexcept: entryRef_(std::move(rhs.entryRef_)) {}
-  DictIterator& operator=(const DictIterator& rhs) {
-    entryRef_ = rhs.entryRef_;
-    return *this;
-  }
+  DictIterator& operator=(const DictIterator& rhs) = default;
   DictIterator& operator=(DictIterator&& rhs) noexcept {
     entryRef_ = std::move(rhs.entryRef_);
     return *this;
@@ -136,7 +141,7 @@ public:
     return &entryRef_;
   }
 
-  friend typename std::iterator<std::random_access_iterator_tag, DictEntryRef<Key, Value, Iterator>>::difference_type operator-(const DictIterator& lhs, const DictIterator& rhs) {
+  friend difference_type operator-(const DictIterator& lhs, const DictIterator& rhs) {
     return lhs.entryRef_.iterator_ - rhs.entryRef_.iterator_;
   }
 
@@ -173,7 +178,7 @@ private:
 
   DictEntryRef<Key, Value, Iterator> entryRef_;
 
-  friend class DictIterator<Key, Value, typename detail::DictImpl::dict_map_type::iterator>;
+  friend class DictIterator<Key, Value, typename c10::detail::DictImpl::dict_map_type::iterator>;
   friend class Dict<Key, Value>;
 };
 
@@ -198,9 +203,10 @@ template<class Key, class Value> Dict<IValue, IValue> toGenericDict(Dict<Key, Va
  * for the kernel API.
  */
 template<class Key, class Value>
+// NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
 class Dict final {
 private:
-  static_assert((std::is_same<IValue, Key>::value && std::is_same<IValue, Value>::value) || guts::typelist::contains<impl::valid_dict_key_types, Key>::value, "Invalid Key type for Dict. We only support int64_t, double, bool, and string.");
+  static_assert((std::is_same_v<IValue, Key> && std::is_same_v<IValue, Value>) || guts::typelist::contains<impl::valid_dict_key_types, Key>::value, "Invalid Key type for Dict. We only support int64_t, double, bool, and string.");
 
   // impl_ stores the underlying map as a ska_ordered::order_preserving_flat_hash_map.
   // We intentionally don't offer conversion from/to
@@ -239,8 +245,6 @@ public:
 
   Dict(const Dict&) = default;
   Dict& operator=(const Dict&) = default;
-  Dict(Dict&&) noexcept;
-  Dict& operator=(Dict&&) noexcept;
 
   /**
    * Create a new Dict pointing to a deep copy of the same data.
@@ -309,7 +313,7 @@ public:
    *
    * @return The number of elements removed. This is either '1' if an element with the key existed, or '0' if it didn't.
    */
-  C10_NODISCARD size_t erase(const Key& key) const;
+  [[nodiscard]] size_t erase(const Key& key) const;
 
   /**
    * Returns the mapped value of the element with key equivalent to key.
@@ -338,9 +342,28 @@ public:
    */
   void reserve(size_type count) const;
 
+  /**
+   * Value equality comparison. This function implements Python-like semantics for
+   * equality: two dicts with the same identity (e.g. same pointer) trivially
+   * compare equal, otherwise each element is compared for equality.
+   */
+  template <class Key_, class Value_>
+  friend bool operator==(
+      const Dict<Key_, Value_>& lhs,
+      const Dict<Key_, Value_>& rhs);
+  template <class Key_, class Value_>
+  friend bool operator!=(
+      const Dict<Key_, Value_>& lhs,
+      const Dict<Key_, Value_>& rhs);
+
+  /**
+   * Identity comparison. Returns true if and only if `rhs` represents the same
+   * Dict object as `this`.
+   */
+  bool is(const Dict& rhs) const;
 
   // private API for now because the return type will change to TypePtr
-  // instead of optional<TypePtr> once types are mandatory.
+  // instead of std::optional<TypePtr> once types are mandatory.
   TypePtr keyType() const;
   TypePtr valueType() const;
 
@@ -370,4 +393,4 @@ namespace torch {
   template<class Key, class Value> using Dict = c10::Dict<Key, Value>;
 }
 
-#include <ATen/core/Dict_inl.h>
+#include <ATen/core/Dict_inl.h>  // IWYU pragma: keep

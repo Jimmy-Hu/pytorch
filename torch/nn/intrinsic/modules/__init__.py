@@ -1,15 +1,33 @@
-# @lint-ignore-every PYTHON3COMPATIMPORTS
+from torch.nn.intrinsic.modules.fused import (
+    _FusedModule,
+    BNReLU2d,
+    BNReLU3d,
+    ConvBn1d,
+    ConvBn2d,
+    ConvBn3d,
+    ConvBnReLU1d,
+    ConvBnReLU2d,
+    ConvBnReLU3d,
+    ConvReLU1d,
+    ConvReLU2d,
+    ConvReLU3d,
+    LinearBn1d,
+    LinearReLU,
+)
 
-from .fused import ConvBn2d
-from .fused import ConvBnReLU2d
-from .fused import ConvReLU2d
-from .fused import ConvReLU3d
-from .fused import LinearReLU
 
 __all__ = [
-    'ConvBn2d',
-    'ConvBnReLU2d',
-    'ConvReLU2d',
-    'ConvReLU3d',
-    'LinearReLU',
+    "BNReLU2d",
+    "BNReLU3d",
+    "ConvBn1d",
+    "ConvBn2d",
+    "ConvBn3d",
+    "ConvBnReLU1d",
+    "ConvBnReLU2d",
+    "ConvBnReLU3d",
+    "ConvReLU1d",
+    "ConvReLU2d",
+    "ConvReLU3d",
+    "LinearBn1d",
+    "LinearReLU",
 ]

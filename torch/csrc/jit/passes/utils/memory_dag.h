@@ -1,21 +1,70 @@
 #pragma once
 
+#include <ATen/core/jit_type.h>
 #include <c10/util/ArrayRef.h>
+#include <c10/util/flat_hash_map.h>
 #include <c10/util/sparse_bitset.h>
+#include <torch/csrc/jit/ir/ir.h>
+#include <torch/csrc/jit/ir/type_hashing.h>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include <torch/csrc/WindowsTorchApiMacro.h>
+#include <torch/csrc/Export.h>
 
 // Uses a compressed index representation for faster comparisons
 typedef c10::SparseBitVector<256> MemoryLocations;
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
-struct Element;
 struct Value;
+
+using AliasTypeSet = std::vector<TypePtr>;
+
+// `Element` represents a vertex in the points-to graph. It represents
+// anything that could have an aliasing relationship--mostly IR
+// `Value`s, but also wildcards or the type inside a container (e.g. `T`
+// in `List[T]`)
+struct Element {
+  Element(const Value* value_, unsigned index_);
+  // wildcard constructor
+  explicit Element(unsigned index_);
+
+  // Index into the owning DAG's bit vector that represents this element.
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  unsigned index;
+
+  // All elements that this element *may* point to. It's possible to have
+  // multiple elements that you might point to due to control flow/complex ops
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  MemoryLocations pointsTo;
+  // Backreference for points-to.
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  MemoryLocations pointedFrom;
+
+  // Elements can contain other elements (e.g. List[Tensor])
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  MemoryLocations containedElements;
+
+  // The values that this element corresponds to. May be empty if this element
+  // doesn't represent a first-class value.
+  // This is for debug information only.
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  std::unordered_set<const Value*> values;
+
+ private:
+  // Make `from` point at `to`.
+  void makePointerTo(Element* from, Element* to);
+
+  friend class MemoryDAG;
+  // We memoize the results of `getMemoryLocations` to speed up queries.
+  // A nullopt means that this cache is not yet populated. Since `MemoryDAG` is
+  // immutable, this cache should never need to be invalidated.
+  mutable std::optional<MemoryLocations> cachedMemoryLocations_;
+
+  mutable std::optional<MemoryLocations> cachedAllContainedMemoryLocations_;
+};
 
 // class MemoryDAG
 //
@@ -23,8 +72,8 @@ struct Value;
 // AliasDb to provide a higher-level API.
 //
 // We maintain a DAG where:
-//   - Vertices (called "elements") represent values and
-//     other aliasing entities (e.g. like the stuff inside a list)
+//   - Vertices (called "Elements") represent Values and
+//     other aliasing entities (e.g. the stuff inside a list)
 //   - Edges represent a "points-to" relationship.
 //
 // Leaves in this DAG are entities that don't point to anything, and thus
@@ -34,29 +83,24 @@ struct Value;
 // which memory locations an element may point to.
 class TORCH_API MemoryDAG {
  public:
+  explicit MemoryDAG(std::vector<std::unique_ptr<Element>> indexToElementMap)
+      : indexToElementMap_(std::move(indexToElementMap)) {}
   // explicitly delete copy constructor because otherwise windows build is
   // confused for an exported class see
   // https://stackoverflow.com/a/51033485/105137
-  MemoryDAG() {}
   MemoryDAG(const MemoryDAG&) = delete;
   MemoryDAG& operator=(const MemoryDAG&) = delete;
 
-  // Make `from` point at `to`.
-  void makePointerTo(Element* from, Element* to);
-
-  void addToContainedElements(Element* contained, Element* container);
-
-  // Make a fresh element (i.e. an element that doesn't point to anything) and
-  // return it.
-  Element* makeFreshValue(const Value* v);
+  // Return the unique memory locations that `Element` might represent.
+  const MemoryLocations& getMemoryLocations(const Element* e) const;
 
   // Do `a` and `b` potentially share a memory location?
   bool mayAlias(const Element* a, const Element* b) const;
-  bool mayAlias(Element* a, Element* b) const;
 
-  // Does a hold reference to any memory that is stored in elem, or vice versa?
+  // Does `a` hold reference to any memory that is stored in `b`, or vice versa?
   bool mayContainAlias(const Element* a, const Element* b) const;
-  bool mayContainAlias(Element* a, Element* b) const;
+
+  bool mayContainAlias(const Element* a, const at::ArrayRef<Element*> b) const;
 
   bool mayContainAlias(
       const at::ArrayRef<Element*> a,
@@ -65,59 +109,66 @@ class TORCH_API MemoryDAG {
   // Converts from the compressed index representation
   const Element* fromIndex(unsigned x) const;
   Element* fromIndex(unsigned x);
+  void collectAllContainedMemoryLocations(
+      const Element* elem,
+      MemoryLocations& cont) const;
+
+  /**
+   * The following methods are special cases where we need to mutate the
+   * internals of MemoryDAG for efficiency reasons. Don't call them unless you
+   * know what you're doing! In particular, don't add new mutating methods
+   * without ensuring that you are maintaining cache consistency for memory
+   * locations.
+   */
+
+  // Adding wildcards can trigger extremely expensive cache invalidations. This
+  // method adds them in a more efficient cache-aware way.
+  void setWildcards(
+      const std::unordered_set<const Value*>& wildcards,
+      const ska::flat_hash_map<const Value*, Element*>& elementMap,
+      const std::function<Element*(const Value*)>& getWildcardElement);
+  Element* unsafeMakeFreshValue(const Value* v);
 
  private:
-  bool mayAliasImpl(const Element* a, const Element* b) const;
-  bool mayContainAliasImpl(const Element* contained, const Element* container)
-      const;
-  void collectAllContainedMemoryLocations(
-    const Element* elem, MemoryLocations& cont) const;
-
+  const MemoryLocations& getAllContainedMemoryLocations(
+      const Element* elem) const;
+  void collectAllContainedMemoryLocationsImpl(
+      const Element* elem,
+      MemoryLocations& cont) const;
   std::vector<std::unique_ptr<Element>> indexToElementMap_;
 };
 
-// `Element` represents the vertex in the points-to graph. It represents
-// anything that could have an aliasing relationship, mostly IR `Value`s, but
-// also the "inside of a list", or wildcards.
-struct Element {
-  Element(MemoryDAG& dag_, const Value* value_, unsigned index_);
+/**
+ * Helper to build up the points-to graph.
+ *
+ * We separate the "building" into a different class because it allows us to
+ * cache internally to MemoryDAG without worrying about how the DAG structure
+ * is mutated.
+ */
+class TORCH_API MemoryDAGBuilder {
+ public:
+  MemoryDAGBuilder() = default;
+  MemoryDAGBuilder(const MemoryDAGBuilder&) = delete;
+  MemoryDAGBuilder& operator=(const MemoryDAGBuilder&) = delete;
 
-  // Reference to the owning DAG.
-  MemoryDAG& dag;
-  // Index into the owning DAG's bit vector that represents this element.
-  unsigned index;
+  // Make `from` point at `to`.
+  void makePointerTo(Element* from, Element* to);
 
-  // All elements that this element *may* point to. It's possible to have
-  // multiple elements that you might point to due to control flow/complex ops
-  MemoryLocations pointsTo;
-  // Backreference for points-to.
-  MemoryLocations pointedFrom;
+  void addToContainedElements(Element* contained, Element* container);
 
-  // Elements can contain other elements (e.g. List[Tensor])
-  MemoryLocations containedElements;
+  std::unique_ptr<MemoryDAG> createMemoryDAG() && {
+    return std::make_unique<MemoryDAG>(std::move(indexToElementMap_));
+  }
 
-  // Return the unique memory locations that `Element` might represent.
-  TORCH_API const MemoryLocations& getMemoryLocations() const;
+  // Make a fresh Element (i.e. an Element that doesn't point to anything) and
+  // return it.
+  Element* makeFreshValue(const Value* v);
 
-  // The value that this element corresponds to. May be null if this element
-  // doesn't represent a first-class value.
-  const Value* value = nullptr;
+  friend MemoryDAG;
 
  private:
-  // We do path compression to make repeated memory location queries faster.
-  // An empty cache means it is invalidated (it can never be empty otherwise,
-  // since every element must point to at least one memory location).
-  mutable MemoryLocations cachedMemoryLocations_;
-
-  enum class BfsDirection {
-    POINTS_TO,
-    POINTED_FROM,
-  };
-  // Do a breadth-first search over the graph, starting at `this` and
-  // traversing in the direction `dir`.`fn` will be run on each element.
-  void bfs(BfsDirection dir, MemoryLocations& res) const;
-  friend class MemoryDAG;
+  // `MemoryDAGBuilder` builds up `indexToElementMap_`, then uses
+  // the map to construct the `MemoryDAG`
+  std::vector<std::unique_ptr<Element>> indexToElementMap_;
 };
-
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

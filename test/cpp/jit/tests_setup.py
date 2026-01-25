@@ -1,32 +1,32 @@
-import sys
 import os
+import sys
+
 import torch
 
 
-class Setup(object):
+class Setup:
     def setup(self):
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def shutdown(self):
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
-class FileSetup(object):
+class FileSetup:
     path = None
 
     def shutdown(self):
         if os.path.exists(self.path):
             os.remove(self.path)
-            pass
 
 
 class EvalModeForLoadedModule(FileSetup):
-    path = 'dropout_model.pt'
+    path = "dropout_model.pt"
 
     def setup(self):
         class Model(torch.jit.ScriptModule):
-            def __init__(self):
-                super(Model, self).__init__()
+            def __init__(self) -> None:
+                super().__init__()
                 self.dropout = torch.nn.Dropout(0.1)
 
             @torch.jit.script_method
@@ -40,7 +40,7 @@ class EvalModeForLoadedModule(FileSetup):
 
 
 class SerializationInterop(FileSetup):
-    path = 'ivalue.pt'
+    path = "ivalue.pt"
 
     def setup(self):
         ones = torch.ones(2, 2)
@@ -51,10 +51,54 @@ class SerializationInterop(FileSetup):
         torch.save(value, self.path, _use_new_zipfile_serialization=True)
 
 
+# See testTorchSaveError in test/cpp/jit/tests.h for usage
+class TorchSaveError(FileSetup):
+    path = "eager_value.pt"
+
+    def setup(self):
+        ones = torch.ones(2, 2)
+        twos = torch.ones(3, 5) * 2
+
+        value = (ones, twos)
+
+        torch.save(value, self.path, _use_new_zipfile_serialization=False)
+
+
+class TorchSaveJitStream_CUDA(FileSetup):
+    path = "saved_stream_model.pt"
+
+    def setup(self):
+        if not torch.cuda.is_available():
+            return
+
+        class Model(torch.nn.Module):
+            def forward(self):
+                s = torch.cuda.Stream()
+                a = torch.rand(3, 4, device="cuda")
+                b = torch.rand(3, 4, device="cuda")
+
+                with torch.cuda.stream(s):
+                    is_stream_s = (
+                        torch.cuda.current_stream(s.device_index()).id() == s.id()
+                    )
+                    c = torch.cat((a, b), 0).to("cuda")
+                s.synchronize()
+                return is_stream_s, a, b, c
+
+        model = Model()
+
+        # Script the model and save
+        script_model = torch.jit.script(model)
+        torch.jit.save(script_model, self.path)
+
+
 tests = [
     EvalModeForLoadedModule(),
     SerializationInterop(),
+    TorchSaveError(),
+    TorchSaveJitStream_CUDA(),
 ]
+
 
 def setup():
     for test in tests:

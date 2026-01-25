@@ -1,34 +1,28 @@
 #include <torch/csrc/distributed/rpc/python_resp.h>
 
-#include <c10/util/C++17.h>
+namespace torch::distributed::rpc {
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+PythonResp::PythonResp(SerializedPyObj&& serializedPyObj)
+    : serializedPyObj_(std::move(serializedPyObj)) {}
 
-PythonResp::PythonResp(
-    std::vector<char> pickledPayload,
-    std::vector<torch::Tensor> tensors)
-    : pickledPayload_(std::move(pickledPayload)),
-      tensors_(std::move(tensors)) {}
-
-Message PythonResp::toMessage() && {
-  return Message(
-      std::move(pickledPayload_), std::move(tensors_), MessageType::PYTHON_RET);
+c10::intrusive_ptr<Message> PythonResp::toMessageImpl() && {
+  auto payload = std::vector<char>(
+      serializedPyObj_.payload_.begin(), serializedPyObj_.payload_.end());
+  return c10::make_intrusive<Message>(
+      std::move(payload),
+      std::move(serializedPyObj_.tensors_),
+      MessageType::PYTHON_RET);
 }
 
 std::unique_ptr<PythonResp> PythonResp::fromMessage(const Message& message) {
-  return std::make_unique<PythonResp>(message.payload(), message.tensors());
+  std::string payload(message.payload().begin(), message.payload().end());
+  std::vector<Tensor> tensors = message.tensors();
+  SerializedPyObj serializedPyObj(std::move(payload), std::move(tensors));
+  return std::make_unique<PythonResp>(std::move(serializedPyObj));
 }
 
-const std::vector<char>& PythonResp::pickledPayload() const {
-  return pickledPayload_;
+const SerializedPyObj& PythonResp::serializedPyObj() const {
+  return serializedPyObj_;
 }
 
-const std::vector<torch::Tensor>& PythonResp::tensors() const {
-  return tensors_;
-}
-
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

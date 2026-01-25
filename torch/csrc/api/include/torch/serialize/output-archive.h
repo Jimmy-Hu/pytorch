@@ -1,7 +1,7 @@
 #pragma once
 
-#include <torch/csrc/WindowsTorchApiMacro.h>
-#include <torch/csrc/jit/script/module.h>
+#include <torch/csrc/Export.h>
+#include <torch/csrc/jit/api/module.h>
 
 #include <iosfwd>
 #include <memory>
@@ -15,18 +15,17 @@ class Tensor;
 namespace torch {
 using at::Tensor;
 namespace jit {
-namespace script {
 struct Module;
-} // namespace script
 } // namespace jit
 } // namespace torch
 
-namespace torch {
-namespace serialize {
+namespace torch::serialize {
 class TORCH_API OutputArchive final {
  public:
-  explicit OutputArchive(std::shared_ptr<jit::script::CompilationUnit> cu);
-  explicit OutputArchive() : cu_(std::make_shared<jit::script::CompilationUnit>()), module_("__torch__.Module", cu_) {}
+  explicit OutputArchive(std::shared_ptr<jit::CompilationUnit> cu);
+  explicit OutputArchive()
+      : cu_(std::make_shared<jit::CompilationUnit>()),
+        module_("__torch__.Module", cu_) {}
 
   // Move is allowed.
   OutputArchive(OutputArchive&&) = default;
@@ -36,7 +35,7 @@ class TORCH_API OutputArchive final {
   OutputArchive(OutputArchive&) = delete;
   OutputArchive& operator=(OutputArchive&) = delete;
 
-  std::shared_ptr<jit::script::CompilationUnit> compilation_unit() const {
+  std::shared_ptr<jit::CompilationUnit> compilation_unit() const {
     return cu_;
   }
 
@@ -67,7 +66,7 @@ class TORCH_API OutputArchive final {
   void save_to(const std::function<size_t(const void*, size_t)>& func);
 
   /// Forwards all arguments to `write()`.
-  /// Useful for generic code that can be re-used for both `OutputArchive` and
+  /// Useful for generic code that can be reused for both `OutputArchive` and
   /// `InputArchive` (where `operator()` forwards to `read()`).
   template <typename... Ts>
   void operator()(Ts&&... ts) {
@@ -75,8 +74,7 @@ class TORCH_API OutputArchive final {
   }
 
  private:
-  std::shared_ptr<jit::script::CompilationUnit> cu_;
-  jit::script::Module module_;
+  std::shared_ptr<jit::CompilationUnit> cu_;
+  jit::Module module_;
 };
-} // namespace serialize
-} // namespace torch
+} // namespace torch::serialize

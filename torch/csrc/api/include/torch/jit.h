@@ -1,13 +1,12 @@
 #pragma once
 
-#include <torch/csrc/WindowsTorchApiMacro.h>
-#include <torch/csrc/jit/script/module.h>
+#include <torch/csrc/Export.h>
+#include <torch/csrc/jit/api/module.h>
 
-#include <string>
 #include <memory>
+#include <string>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 /// Compiles script code into an executable graph.
 ///
@@ -30,7 +29,6 @@ namespace jit {
 ///   )JIT");
 ///   IValue output = module->run_method("relu_script", a, b);
 /// \endrst
-TORCH_API std::shared_ptr<script::CompilationUnit> compile(const std::string& source);
+TORCH_API std::shared_ptr<CompilationUnit> compile(const std::string& source);
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

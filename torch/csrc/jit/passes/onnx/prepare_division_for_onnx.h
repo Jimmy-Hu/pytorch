@@ -1,9 +1,8 @@
 #pragma once
 
-#include <torch/csrc/jit/ir.h>
+#include <torch/csrc/jit/ir/ir.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // Prepare division ops for ONNX export. This is necessary for and only used
 // by ONNX export.
@@ -15,5 +14,4 @@ namespace jit {
 //
 TORCH_API void PrepareDivisionForONNX(const std::shared_ptr<Graph>& graph);
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

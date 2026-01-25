@@ -5,8 +5,11 @@
 #include <torch/csrc/python_headers.h>
 
 #include <ATen/Device.h>
-#include <c10/core/ScalarType.h>
 #include <c10/core/Backend.h>
+#include <c10/core/Layout.h>
+#include <c10/core/ScalarType.h>
+#include <c10/core/ScalarTypeToTypeMeta.h>
+#include <torch/csrc/Export.h>
 
 #include <memory>
 #include <string>
@@ -19,17 +22,16 @@ struct Storage;
 }
 
 namespace torch {
-// Register a PyTypeObject* with the given attributes
-void registerStoragePyTypeObject(
-    PyTypeObject *pytype, at::Backend backend, at::ScalarType scalarType);
+void registerDtypeObject(THPDtype* dtype, at::ScalarType scalarType);
+void registerLayoutObject(THPLayout* thp_layout, at::Layout layout);
 
-void registerDtypeObject(THPDtype *dtype, at::ScalarType scalarType);
-void registerLayoutObject(THPLayout *layout, at::Backend backend);
+TORCH_PYTHON_API PyObject* createPyObject(const at::Storage& storage);
+TORCH_PYTHON_API at::Storage createStorage(PyObject* obj);
+TORCH_PYTHON_API std::tuple<at::Storage, at::ScalarType, bool>
+createStorageGetType(PyObject* obj);
+TORCH_PYTHON_API bool isStorage(PyObject* obj);
 
-PyObject* createPyObject(const at::Storage& storage);
-at::Storage createStorage(PyObject* obj);
-bool isStorage(PyObject* obj);
-
-THPDtype* getDtype(at::ScalarType scalarType);
-THPLayout* getLayout(at::Backend backend);
-}  // namespace torch
+// Both methods below return a borrowed reference!
+TORCH_PYTHON_API THPDtype* getTHPDtype(at::ScalarType scalarType);
+TORCH_PYTHON_API THPLayout* getTHPLayout(at::Layout layout);
+} // namespace torch

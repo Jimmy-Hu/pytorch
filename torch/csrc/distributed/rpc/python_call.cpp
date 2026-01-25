@@ -1,36 +1,55 @@
 #include <torch/csrc/distributed/rpc/python_call.h>
 
-#include <c10/util/C++17.h>
+namespace torch::distributed::rpc {
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+PythonCall::PythonCall(SerializedPyObj&& serializedPyObj, bool isAsyncExecution)
+    : serializedPyObj_(std::move(serializedPyObj)),
+      isAsyncExecution_(isAsyncExecution) {}
 
-PythonCall::PythonCall(
-    std::vector<char> pickledPayload,
-    std::vector<torch::Tensor> tensors)
-    : pickledPayload_(std::move(pickledPayload)),
-      tensors_(std::move(tensors)) {}
+#if defined(__GNUC__) && __GNUC__ == 14
+/* this warning is falsely triggered with gcc-14 in following function. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
 
-Message PythonCall::toMessage() && {
-  return Message(
-      std::move(pickledPayload_),
-      std::move(tensors_),
+c10::intrusive_ptr<Message> PythonCall::toMessageImpl() && {
+  std::vector<char> payload;
+  payload.reserve(serializedPyObj_.payload_.length() + 1);
+  payload.push_back(isAsyncExecution_ ? 1 : 0);
+  payload.insert(
+      payload.end(),
+      serializedPyObj_.payload_.begin(),
+      serializedPyObj_.payload_.end());
+
+  return c10::make_intrusive<Message>(
+      std::move(payload),
+      std::move(serializedPyObj_.tensors_),
       MessageType::PYTHON_CALL);
 }
 
+#if defined(__GNUC__) && __GNUC__ == 14
+#pragma GCC diagnostic pop
+#endif
+
 std::unique_ptr<PythonCall> PythonCall::fromMessage(const Message& message) {
-  return std::make_unique<PythonCall>(message.payload(), message.tensors());
+  TORCH_INTERNAL_ASSERT(
+      !message.payload().empty(),
+      "Failed to convert an RPC message to PythonCall, the payload should at "
+      "least contain one byte indicating whether this is an async function, "
+      "but got payload of size ",
+      message.payload().size());
+  const char& c = message.payload()[0];
+  TORCH_INTERNAL_ASSERT(c == 0 || c == 1);
+  bool isAsyncExecution = (c == 1);
+  std::string payload(message.payload().begin() + 1, message.payload().end());
+  std::vector<Tensor> tensors = message.tensors();
+  SerializedPyObj serializedPyObj(std::move(payload), std::move(tensors));
+  return std::make_unique<PythonCall>(
+      std::move(serializedPyObj), isAsyncExecution);
 }
 
-const std::vector<char>& PythonCall::pickledPayload() const {
-  return pickledPayload_;
+const SerializedPyObj& PythonCall::serializedPyObj() const {
+  return serializedPyObj_;
 }
 
-const std::vector<torch::Tensor>& PythonCall::tensors() const {
-  return tensors_;
-}
-
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc
