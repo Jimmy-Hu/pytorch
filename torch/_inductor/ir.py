@@ -346,29 +346,22 @@ def get_stride_order(
 
 
 @overload
-def ir_node_to_tensor(x: None, replace_symbols_with_hints: bool = False) -> None: ...
+def ir_node_to_tensor(x: None, guard_shape: bool = True) -> None: ...
 
 
 @overload
-def ir_node_to_tensor(
-    x: IRNode, replace_symbols_with_hints: bool = False
-) -> torch.Tensor: ...
+def ir_node_to_tensor(x: IRNode, guard_shape: bool = True) -> torch.Tensor: ...
 
 
 def ir_node_to_tensor(
-    x: Optional[IRNode], replace_symbols_with_hints: bool = False
+    x: Optional[IRNode], guard_shape: bool = True
 ) -> Optional[torch.Tensor]:
-    # When replace_symbols_with_hints=False (default), sizes/strides remain as
-    # symbolic expressions, so downstream operations on the resulting tensor (e.g.,
-    # shape comparisons inside a kernel's meta function) may install guards. When
-    # True, symbolic expressions are replaced with concrete integer hints via
-    # size_hint, preventing any downstream guards.
     if x is None:
         return None
 
     shape_fn: Callable[[Union[int, Expr]], Union[int, Expr]]
-    if replace_symbols_with_hints:
-        shape_fn = V.graph.sizevars.optimization_hint
+    if not guard_shape:
+        shape_fn = V.graph.sizevars.size_hint
     else:
         shape_fn = identity
     size = [shape_fn(s) for s in x.get_size()]
@@ -5331,6 +5324,8 @@ class ChoiceCaller:
         # knowing what autotuning is choosing)
         self.description = description
         self.failed: bool = False
+        # When True, benchmark using CUDA graph capture/replay
+        self._benchmark_with_cudagraphs: bool = False
         # A place to store annotations that can be read post benchmarking
         # Use this to shuttle information between ChoieCaller generation
         # and the end of benchmarking
@@ -5338,6 +5333,8 @@ class ChoiceCaller:
 
     def benchmark(self, *args: Any, out: torch.Tensor) -> float:
         algo = self.to_callable()
+        if self._benchmark_with_cudagraphs:
+            return benchmarker.benchmark_gpu_with_cuda_graph(lambda: algo(*args))
         if config.profile_bandwidth_with_do_bench_using_profiling:
             return do_bench_using_profiling(lambda: algo(*args))  # type: ignore[arg-type]
         return benchmarker.benchmark(algo, args, {"out": out}, device=None)
@@ -6237,7 +6234,7 @@ class ExternKernel(InputsKernel):
                     torch.cuda.default_generators[device_index].clone_state()
                 )
             else:
-                example_args.append(ir_node_to_tensor(x))
+                example_args.append(ir_node_to_tensor(x, guard_shape=True))
 
         new_args, new_kwargs = unflatten_args(example_args, non_tensor_args)
         example_output = kernel(*new_args, **new_kwargs)
