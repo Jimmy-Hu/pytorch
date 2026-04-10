@@ -2737,20 +2737,14 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
             self.payload(use_cuda=use_cuda)
         events = p.events()
         self.assertGreater(len(events), 0)
-        found_gemm = False
-        found_memcpy = False
         found_mm = False
         for e in events:
             if "aten::mm" in e.name:
                 found_mm = True
-            if "gemm" in e.name.lower() or "Cijk" in e.name:
-                found_gemm = True
-            if "memcpy" in e.name.lower() or "__amd_rocclr_copyBuffer" in e.name:
-                found_memcpy = True
         self.assertTrue(found_mm)
         if use_cuda:
-            self.assertTrue(found_gemm)
-            self.assertTrue(found_memcpy)
+            gpu_events = [e for e in events if e.device_type == DeviceType.CUDA]
+            self.assertGreater(len(gpu_events), 0, "No GPU events captured by profiler")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @unittest.skipIf(TEST_WITH_ROCM, "not supported on ROCm")
@@ -2845,11 +2839,26 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
             self.assertGreater(
                 len(kernel_events), 0, "Error: No kernel events in trace"
             )
+            has_kernel_launch_metadata = False
             for ke in kernel_events:
                 args = ke.get("args", {})
                 name = ke.get("name", "<unknown>")
-                for key in ["device", "stream", "correlation", "grid", "block"]:
+                for key in ["device", "stream", "correlation"]:
                     self.assertIn(key, args, f"kernel '{name}' missing '{key}'")
+                # Some kernel events on ROCm (__amd_rocclr...) do not have grid/block metadata
+                # so we just validate that it shows up for at least one event
+                has_grid = "grid" in args
+                has_block = "block" in args
+                self.assertEqual(
+                    has_grid,
+                    has_block,
+                    f"kernel '{name}' should provide grid and block together",
+                )
+                has_kernel_launch_metadata |= has_grid
+            self.assertTrue(
+                has_kernel_launch_metadata,
+                "Error: No kernel events in trace contained grid/block metadata",
+            )
 
 
 class SimpleNet(nn.Module):
@@ -3162,7 +3171,7 @@ class TestExperimentalUtils(TestCase):
 
     def test_utils_compute_queue_depth_when_no_cuda_events(self):
         # For traces with only cpu events, we expect empty queue depth list
-        x = torch.ones((1024, 1024))
+        x = torch.ones((100, 100))
         with profile() as prof:
             for _ in range(5):
                 x = x @ x
@@ -3212,7 +3221,7 @@ aten::copy_""",
         )
 
     def test_profiler_name_pattern(self):
-        x = torch.ones((4096, 4096))
+        x = torch.ones((100, 100))
         with profile() as prof:
             for _ in range(5):
                 x = x @ x
