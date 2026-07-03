@@ -2081,7 +2081,8 @@ class TestTorchDeviceType(TestCase):
                           lambda: torch.randperm(20000, device=device),
                           lambda: torch.repeat_interleave(x, 2, output_size=2 * size),
                           lambda: torch.repeat_interleave(x, repeats, output_size=2 * size),
-                          lambda: torch.any(y))
+                          lambda: torch.any(y),
+                          lambda: torch.normal(x, x))
         expect_sync = (lambda: _ind_put_fn(x, mask, y),
                        lambda: _ind_put_fn(x, ind_cpu, y),
                        lambda: _ind_get_fn(x, mask),
@@ -2864,6 +2865,11 @@ class TestTorchDeviceType(TestCase):
         test_ops(torch.cummin, "cummin", torch.tensor([[1, 0, 1],
                                                        [0, 0, 0],
                                                        [0, 0, 0]]), expected_out)
+
+        for op in [torch.cummax, torch.cummin]:
+            x = torch.randn(5, dtype=torch.complex64, device=device)
+            with self.assertRaisesRegex(RuntimeError, "not implemented for 'ComplexFloat'"):
+                op(x, 0)
 
     def test_logcumsumexp(self, device):
         def logcumsumexp(a, axis):
