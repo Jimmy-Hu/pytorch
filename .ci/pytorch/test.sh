@@ -9,6 +9,17 @@ set -ex -o pipefail
 # Suppress ANSI color escape sequences
 export TERM=vt100
 
+# Retry-policy A/B experiment (see unstable.yml). The test config name is the only
+# per-job channel available without changing the shared _linux-test.yml, so the
+# suffix is stripped back to the real config here: everything downstream then sees
+# the same TEST_CONFIG as the trunk arm we are comparing against, and the only
+# difference is the retry policy.
+if [[ "${TEST_CONFIG}" == *_retry_experiment ]]; then
+  export TEST_CONFIG="${TEST_CONFIG%_retry_experiment}"
+  export PYTORCH_NUM_PYTEST_RERUNS=0
+  export PYTORCH_NUM_PROCESS_RETRIES=1
+fi
+
 # shellcheck source=./common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck source=./common-build.sh
@@ -449,7 +460,9 @@ test_python_smoke() {
 test_python_smoke_b200() {
   # Targeted smoke tests for B200 including FlashAttention CuTe coverage
   install_flash_attn_cute
-  install_cutlass_api
+  # TODO(#189590): Re-enable CUTLASS API after NVGEMM migrates to
+  # cutlass.operators. The preview package pins apache-tvm-ffi==0.1.7, which
+  # is incompatible with CuTeDSL 4.6.2 used by the rest of this job.
   time python test/run_test.py \
     --include \
       test_matmul_cuda \
@@ -459,6 +472,7 @@ test_python_smoke_b200() {
       nn/attention/test_open_registry \
       inductor/test_flex_flash \
       inductor/test_flex_gemm \
+      python_native/test_cutedsl_smoketest \
       inductor/test_torchinductor \
       inductor/test_async_compile \
       inductor/test_nv_universal_gemm \
