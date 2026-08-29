@@ -4950,6 +4950,23 @@ def sample_inputs_linear(self, device, dtype, requires_grad, include_empty=True,
         yield SampleInput(create_tensor(3, 4, 0), create_tensor(5, 0))
         yield SampleInput(create_tensor(3, 4, 0), create_tensor(5, 0), create_tensor(5))
 
+    # 1D weight contracts away the last input dim (out_features == 1 with the
+    # trailing output dim squeezed); its backward used to SIGABRT on MPS, see
+    # https://github.com/pytorch/pytorch/issues/187988. No bias samples: a 1D
+    # weight only takes a scalar bias, which functorch transforms reject, see
+    # https://github.com/pytorch/pytorch/issues/188891.
+    # Skipped on ROCm: the decomposed matmul reduces in a different order than
+    # eager, so test_eager_equivalence (which runs at ~1 ULP tolerance) fails.
+    if torch.version.hip is None:
+        yield SampleInput(create_tensor(8, 3), create_tensor(3))
+        yield SampleInput(create_tensor(2, 3, 4), create_tensor(4))
+        yield SampleInput(create_tensor(2, 1, 2, 1, 2), create_tensor(2))
+        if include_empty:
+            # An empty reduction dim and an empty batch, where the shortcuts taken for
+            # zero-element tensors still have to drop the 1D weight's output dim.
+            yield SampleInput(create_tensor(3, 4, 0), create_tensor(0))
+            yield SampleInput(create_tensor(0, 8), create_tensor(8))
+
 def sample_inputs_bilinear(self, device, dtype, requires_grad, **kwargs):
     features_options = [[3, 4, 5], [8, 8, 8]]
     batch_options: list[list[int]] = [
@@ -7174,6 +7191,10 @@ def sample_inputs_linear_cross_entropy(op_info, device, dtype, requires_grad, *,
                 # skip samples with linear bias as unsupported
                 continue
 
+            if linear_weight.dim() == 1:
+                # linear_cross_entropy requires a linear weight of rank >= 2
+                continue
+
             num_classes = linear_weight.shape[0]
             num_batches = linear_input.shape[:-1]
             input_shape = (*num_batches, num_classes)
@@ -9029,6 +9050,10 @@ def sample_inputs_nll_loss(op_info, device, dtype, requires_grad, **kwargs):
 
     target = torch.tensor([-1, 2], device=device, dtype=torch.long)
     yield SampleInput(make_input(shape), args=(target,), kwargs={'ignore_index': -1})
+
+    # Noncontiguous target
+    target = torch.randint(num_classes, (2 * shape[0],), device=device)[::2]
+    yield SampleInput(make_input(shape), args=(target,))
 
 
 def sample_inputs_binary_cross_entropy_with_logits(
@@ -12365,9 +12390,6 @@ op_db: list[OpInfo] = [
                    dtypes=(torch.complex64, torch.complex128)),
                DecorateInfo(toleranceOverride({torch.float16: tol(atol=1e-3, rtol=2e-3)}),
                             "TestConsistency", "test_output_grad_match", device_type="mps"),
-               # RuntimeError: value cannot be converted to type double without overflow
-               DecorateInfo(unittest.expectedFailure, 'TestCommon', device_type='mps', dtypes=(torch.complex64,)),
-               DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
            )),
     OpInfo('addmm',
            # When alpha=beta=1 as compile-time constants, JIT will decompose addmm into mm and add.
@@ -22605,8 +22627,6 @@ DecorateInfo(unittest.skip("Skipped!"), 'TestDecomp', 'test_quick'),
                 "test_cow_input",
                 device_type=('cuda', 'xpu'),
             ),
-            DecorateInfo(unittest.skip("FP16 nll_loss cases have not been enabled on MPS yet"),
-                         dtypes=(torch.half,), device_type="mps"),
         ),
     ),
     OpInfo(
