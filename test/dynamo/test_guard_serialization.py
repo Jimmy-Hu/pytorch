@@ -764,6 +764,41 @@ class RaisingProbes:
         raise RuntimeError(f"probed {name}")
 
 
+class RaisingNameProxy:
+    # A callable whose __name__ lookup raises something other than
+    # AttributeError, as a proxy might. Records what was asked for, so a test
+    # can pin that the reducer never asks at all.
+    probed: list[str] = []
+
+    def __getattr__(self, name):
+        RaisingNameProxy.probed.append(name)
+        if name == "__name__":
+            raise RuntimeError("proxy has no __name__")
+        raise AttributeError(name)
+
+    def __call__(self, obj, x):
+        return x
+
+
+def _shared_cell_wrappers():
+    shared = torch.zeros(2)
+
+    @functools.wraps(global_func)
+    def a(x):
+        return shared
+
+    @functools.wraps(global_func)
+    def b(x):
+        return shared
+
+    return a, b
+
+
+# wraps gives both global_func's qualname (no "<locals>"), so they are
+# fqn-mismatched and rebuilt by value only when a guard registers them.
+SHARED_CELL_WRAPPED_A, SHARED_CELL_WRAPPED_B = _shared_cell_wrappers()
+
+
 class PlainMethods:
     def add(self, x):
         return x
@@ -1240,20 +1275,11 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         self.assertIsInstance(out.__kwdefaults__["a"], Inputs)
 
     def test_rebuilt_functions_keep_a_shared_closure_cell_shared(self):
-        # Two functions closing over one variable must still share the cell
-        # after reload; rebuilding every cell silently unshares them.
-        def outer():
-            shared = torch.zeros(2)
-
-            def a():
-                return shared
-
-            def b():
-                return shared
-
-            return a, b
-
-        a, b = outer()
+        # Two fqn-mismatched functions (wraps wrappers, so the guard_tree_values
+        # gate is what carries them; a <locals> pair never consults it) closing
+        # over one variable must still share the cell after reload; rebuilding
+        # every cell silently unshares them.
+        a, b = SHARED_CELL_WRAPPED_A, SHARED_CELL_WRAPPED_B
         self.assertIs(a.__closure__[0], b.__closure__[0])
         buf = io.BytesIO()
         cell = a.__closure__[0]
@@ -1262,6 +1288,8 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         pickler.dump({"a": a, "b": b})
         out = pickle.loads(buf.getvalue())
         self.assertIs(out["a"].__closure__[0], out["b"].__closure__[0])
+        # The gate carried the cell's contents rather than pruning them.
+        self.assertNotIsInstance(out["a"].__closure__[0].cell_contents, _Missing)
 
     def test_rebuilt_locals_function_keeps_its_name(self):
         # The old <locals> rebuild passed __qualname__ where FunctionType wants
@@ -1279,6 +1307,37 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         out = pickle.loads(buf.getvalue())["fn"]
         self.assertEqual((out.__name__, out.__qualname__), ("f", fn.__qualname__))
 
+    def test_rebuilt_wrapper_is_scoped_to_the_module_that_compiled_it(self):
+        # functools.wraps copies __module__ from the wrappee, but the wrapper's
+        # body reads the decorator module's globals. A rebuild that imported
+        # __module__ handed it the wrappee's dict; the compile scope travels
+        # separately so the rebuilt function's __globals__ is the decorator's.
+        deco_mod = types.ModuleType("_guard_deco_mod_for_scope_test")
+        deco_mod.SCALE = 100
+        exec(
+            "import functools\n"
+            "def deco(f):\n"
+            "    @functools.wraps(f)\n"
+            "    def wrapper(x):\n"
+            "        return f(x) * SCALE\n"
+            "    return wrapper\n",
+            deco_mod.__dict__,
+        )
+        sys.modules[deco_mod.__name__] = deco_mod
+        self.addCleanup(sys.modules.pop, deco_mod.__name__, None)
+        fn = deco_mod.deco(global_func)
+        self.assertEqual(fn.__module__, __name__)
+        buf = io.BytesIO()
+        # global_func is registered so the closure cell holding it is kept and
+        # the rebuilt wrapper can be CALLED (the guard pickler never does).
+        gtv = {id(fn): fn, id(global_func): global_func}
+        GuardsStatePickler(gtv, {}, {}, {}, buf).dump({"fn": fn})
+        out = pickle.loads(buf.getvalue())["fn"]
+        self.assertIs(out.__globals__, deco_mod.__dict__)
+        self.assertEqual(out.__module__, __name__)
+        # SCALE resolves through the decorator module; __module__'s dict has none.
+        self.assertEqual(out(1), (1 + 1) * 100)
+
     def test_reduce_restores_a_non_str_module(self):
         # Dynamo cannot trace a function whose __module__ is not a str (its
         # trace rules split it), so this is pickler-level: a decorator can still
@@ -1291,6 +1350,59 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         GuardsStatePickler({id(fn): fn}, {}, {}, {}, buf).dump({"fn": fn})
         out = pickle.loads(buf.getvalue())["fn"]
         self.assertEqual(out.__module__, ["not", "a", "module"])
+        # A non-str __module__ still has a compile scope, and that is what the
+        # rebuilt function gets as its globals.
+        self.assertIs(out.__globals__, globals())
+
+    def test_fqn_resolves_only_when_pickle_by_name_lands_on_the_function(self):
+        # The shared test behind "rebuild from the code object or not": True
+        # only when importing __module__ and walking __qualname__ gets this
+        # exact object back, which is what pickle's by-reference path does.
+        resolves = GuardsStatePickler._fqn_resolves
+        self.assertTrue(resolves(global_func))
+        self.assertTrue(resolves(PlainMethods.add))  # a dotted qualname walk
+
+        def local_fn(x):
+            return x
+
+        wrapper = functools.wraps(global_func)(lambda x: global_func(x))
+        self.assertEqual(
+            (wrapper.__module__, wrapper.__qualname__), (__name__, "global_func")
+        )
+        renamed = types.FunctionType(global_func.__code__, globals(), "global_func")
+        renamed.__qualname__ = "no_such_name"
+        exec_fn = types.FunctionType(
+            global_func.__code__, {"__name__": "_not_in_sys_modules"}, "global_func"
+        )
+        odd = types.FunctionType(global_func.__code__, globals(), "global_func")
+        odd.__module__ = ["not", "a", "module"]  # unhashable: must not TypeError
+        walks = types.FunctionType(global_func.__code__, globals(), "global_func")
+        walks.__qualname__ = "PlainMethods.<locals>.f"
+        # The walk alone would land on `walks`; the <locals> component is
+        # refused before it, as pickle refuses it.
+        setattr(PlainMethods, "<locals>", types.SimpleNamespace(f=walks))
+        self.addCleanup(delattr, PlainMethods, "<locals>")
+        # The oracle is pickle itself: every False case fails a by-reference
+        # dump. save_global replaces the import/lookup failure with a
+        # PicklingError; the C pickler raises a bare AttributeError for a
+        # <locals> name below 3.14 and PicklingError from 3.14 on, and from 3.14
+        # on lets the import's TypeError through for a non-str __module__.
+        new_pickle = sys.version_info >= (3, 14)
+        locals_exc = pickle.PicklingError if new_pickle else AttributeError
+        unhashable_exc = TypeError if new_pickle else pickle.PicklingError
+        cases = {
+            "locals": (local_fn, locals_exc),
+            "locals_component_that_walks": (walks, locals_exc),
+            "wraps_wrapper": (wrapper, pickle.PicklingError),
+            "bad_qualname": (renamed, pickle.PicklingError),
+            "module_not_imported": (exec_fn, pickle.PicklingError),
+            "unhashable_module": (odd, unhashable_exc),
+        }
+        for case, (fn, exc) in cases.items():
+            with self.subTest(case=case):
+                self.assertFalse(resolves(fn))
+                with self.assertRaises(exc):
+                    pickle.dumps(fn)
 
     def test_pruned_shared_closure_cell_stays_shared(self):
         # An unguarded shared cell prunes to a single _Missing cell, and the two
@@ -1674,7 +1786,10 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         # explicitly. That is also what keeps the right function: a module whose
         # class cannot be pickled by reference is rebuilt as a bare nn.Module, on
         # which a getattr() reconstruction would resolve "forward" to
-        # nn.Module's own placeholder.
+        # nn.Module's own placeholder. The call is what pins that (the
+        # placeholder raises NotImplementedError); the two name assertions just
+        # record what the rebuild carries, and the name path itself is pinned by
+        # test_rebuilt_locals_function_keeps_its_name.
         class Local(torch.nn.Module):
             def forward(self, x):
                 return x + 1
@@ -1684,11 +1799,46 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         GuardsStatePickler({id(mod): mod}, {}, {}, {}, buf).dump({"m": mod.forward})
         out = pickle.loads(buf.getvalue())["m"]
         self.assertIs(type(out.__self__), torch.nn.Module)
-        # The code object's name, not __qualname__: at this commit the <locals>
-        # rebuild passes __qualname__ as the function's NAME, and on 3.10
-        # FunctionType then reports the bare co_name as __qualname__.
+        self.assertEqual(out.__func__.__name__, "forward")
         self.assertEqual(out.__func__.__code__.co_name, "forward")
         self.assertEqual(out(torch.ones(1)), torch.ones(1) + 1)
+
+    def test_bound_method_monkeypatched_onto_a_plain_instance(self):
+        # A method stored in the instance __dict__ (a plain receiver: an
+        # nn.Module takes the __getattr__ gate first) resolves only after self
+        # is restored, so pickle's getattr() reconstruction would miss it; the
+        # pair carries it.
+        obj = PlainMethods()
+        obj.global_add = types.MethodType(global_add, obj)
+        buf = io.BytesIO()
+        GuardsStatePickler({}, {}, {}, {}, buf).dump({"m": obj.global_add})
+        out = pickle.loads(buf.getvalue())["m"]
+        self.assertIs(out.__func__, global_add)
+        self.assertIs(type(out.__self__), PlainMethods)
+        self.assertEqual(out(1), 2)
+
+    def test_bound_method_whose_func_raises_on_name_takes_the_pair(self):
+        # __func__ is an arbitrary callable; a proxy whose __getattr__ raises
+        # something other than AttributeError for __name__ must not escape the
+        # reducer.
+        method = types.MethodType(RaisingNameProxy(), PlainMethods())
+        buf = io.BytesIO()
+        GuardsStatePickler({}, {}, {}, {}, buf).dump({"m": method})
+        out = pickle.loads(buf.getvalue())["m"]
+        self.assertIs(type(out.__func__), RaisingNameProxy)
+        self.assertEqual(out(3), 3)
+        # A receiver whose class defines __getattr__ takes the pair at the gate,
+        # so the name is never asked for: this pins the read as being BELOW that
+        # gate, not merely inside the try.
+        RaisingNameProxy.probed.clear()
+        method = types.MethodType(RaisingNameProxy(), GetattrProxy())
+        buf = io.BytesIO()
+        GuardsStatePickler({}, {}, {}, {}, buf).dump({"m": method})
+        self.assertNotIn("__name__", RaisingNameProxy.probed)
+        out = pickle.loads(buf.getvalue())["m"]
+        self.assertIs(type(out.__func__), RaisingNameProxy)
+        self.assertIs(type(out.__self__), GetattrProxy)
+        self.assertEqual(out(3), 3)
 
 
 # NB config.patch subclasses the class it decorates, so it has to go outermost:
@@ -1707,10 +1857,11 @@ class TestGuardSerialization(TestGuardSerializationBase):
         self._test_serialization("TENSOR_MATCH", fn, torch.randn(3), foo)
 
     def test_guard_through_globals_of_a_wrapper_from_another_module(self):
-        # __module__ names the wrapped function's module, so an import at load
-        # would hand the rebuilt wrapper THAT module's dict and the guard
-        # reading wrapper.__globals__[name] would KeyError while the guard
-        # manager is built. The snapshot carries the dict the guard read.
+        # A guard reads through wrapper.__globals__, so the dict it read travels
+        # as a snapshot; __module__ is the wrapped function's and is restored as
+        # an attribute. The wrapper lives in this module, so an import of its
+        # compile scope would land on the same live dict; what only the snapshot
+        # provides is pinned by test_snapshot_keeps_the_save_time_value_of_a_guarded_global.
         global OTHER_MODULE_CONST
         wrapper = WRAPPED_FROM_OTHER_MODULE
         self.assertEqual(wrapper.__module__, torch._dynamo.testing.__name__)
@@ -1891,9 +2042,10 @@ class TestGuardSerialization(TestGuardSerializationBase):
             self._test_serialization("EQUALS_MATCH", mod, torch.randn(3))
 
     def test_fqn_mismatched_function_from_a_module_gone_at_load(self):
-        # The rebuilt function's __module__ names a module that only ever lived
-        # in sys.modules (exec-created, transformers_modules.*), so the load
-        # cannot import it; see FunctionPicklerBase._unpickle_fn_from_module.
+        # The rebuilt function's compile scope, __globals__["__name__"], names a
+        # module that only ever lived in sys.modules (exec-created,
+        # transformers_modules.*), so the load cannot import it; see
+        # FunctionPicklerBase._unpickle_fn_from_module.
         name = "dynamo_test_guard_serialization_exec_module"
         mod = types.ModuleType(name)
         mod.keep_fn_name = keep_fn_name
