@@ -330,14 +330,65 @@ TEST(TestNative, PoolDowncastCompatibility) {
   }
 }
 
-// The handle of a mode made in C++, which has no Python object
-static std::shared_ptr<c10::FakeTensorModeHandle> make_cpp_fake_mode(
+// A mode made in C++ starts without a Python wrapper.
+static std::shared_ptr<c10::FakeTensorMode> make_cpp_fake_mode(
     bool allow_meta = true,
     bool allow_unsafe_data_ptr_access = true) {
-  return std::make_shared<c10::FakeTensorModeHandle>(
-      c10::FakeTensorModeHandle{
-          std::make_shared<c10::FakeTensorMode>(
-              nullptr, nullptr, allow_meta, allow_unsafe_data_ptr_access)});
+  return std::make_shared<c10::FakeTensorMode>(
+      nullptr, nullptr, allow_meta, allow_unsafe_data_ptr_access);
+}
+
+TEST(TestNative, FakeDetach) {
+  auto input = at::empty({2, 3}, at::device(at::kMeta));
+  input.set_requires_grad(true);
+  auto mode = make_cpp_fake_mode();
+  at::init_cpp_fake(input.unsafeGetTensorImpl(), c10::Device(c10::kCPU), mode);
+  auto keys = c10::DispatchKeySet(c10::DispatchKey::CPU);
+  input.unsafeGetTensorImpl()->set_fake_dispatch_keys(keys);
+
+  c10::impl::ExcludeDispatchKeyGuard no_fake(c10::DispatchKey::Fake);
+  auto result = at::impl::fake_detach(input);
+  EXPECT_NE(result.unsafeGetTensorImpl(), input.unsafeGetTensorImpl());
+  EXPECT_EQ(
+      result.storage().unsafeGetStorageImpl(),
+      input.storage().unsafeGetStorageImpl());
+  EXPECT_EQ(result.sizes(), input.sizes());
+  EXPECT_EQ(result.device(), input.device());
+  EXPECT_TRUE(result.is_fake());
+  EXPECT_EQ(result.unsafeGetTensorImpl()->fake_tensor_mode(), mode);
+  EXPECT_EQ(result.unsafeGetTensorImpl()->fake_dispatch_keys(), keys);
+  EXPECT_FALSE(result.requires_grad());
+  EXPECT_TRUE(input.requires_grad());
+}
+
+TEST(TestNative, FakeShallowCopyData) {
+  auto mode = make_cpp_fake_mode();
+  for (auto device : {c10::Device(c10::kCPU), c10::Device(c10::kCUDA, 0)}) {
+    auto source_device = device.is_cpu() ? c10::Device(c10::kCUDA, 0)
+                                         : c10::Device(c10::kCPU);
+    auto input = at::empty({2}, at::device(at::kMeta));
+    input.set_requires_grad(true);
+    auto source = at::empty({3, 4}, at::device(at::kMeta));
+    at::init_cpp_fake(input.unsafeGetTensorImpl(), device, mode);
+    at::init_cpp_fake(source.unsafeGetTensorImpl(), source_device, mode);
+    const auto version =
+        input.unsafeGetTensorImpl()->version_counter().current_version();
+
+    c10::impl::ExcludeDispatchKeyGuard no_fake(c10::DispatchKey::Fake);
+    auto& result = at::impl::fake_shallow_copy_data_(input, source);
+    EXPECT_TRUE(result.is_same(input));
+    EXPECT_EQ(
+        input.storage().unsafeGetStorageImpl(),
+        source.storage().unsafeGetStorageImpl());
+    EXPECT_EQ(input.sizes(), source.sizes());
+    EXPECT_EQ(input.strides(), source.strides());
+    EXPECT_EQ(input.device(), source_device);
+    EXPECT_TRUE(input.is_fake());
+    EXPECT_EQ(input.unsafeGetTensorImpl()->fake_tensor_mode(), mode);
+    EXPECT_EQ(input.unsafeGetTensorImpl()->version_counter().current_version(), version);
+    EXPECT_TRUE(input.requires_grad());
+    EXPECT_FALSE(source.requires_grad());
+  }
 }
 
 TEST(TestNative, AsStridedPreservesFakeTensorMetadata) {
@@ -355,7 +406,7 @@ TEST(TestNative, AsStridedPreservesFakeTensorMetadata) {
   EXPECT_EQ(*fake_device, c10::Device(c10::kCPU));
   auto handle = result_impl->fake_tensor_mode();
   ASSERT_NE(handle, nullptr);
-  EXPECT_EQ(handle->mode, mode->mode);
+  EXPECT_EQ(handle, mode);
 }
 
 TEST(TestNative, InitCppFake) {
@@ -364,7 +415,7 @@ TEST(TestNative, InitCppFake) {
     auto t = at::empty({2}, at::device(at::kMeta));
     at::init_cpp_fake(t.unsafeGetTensorImpl(), c10::Device(c10::kCPU), mode);
     auto handle = t.unsafeGetTensorImpl()->fake_tensor_mode();
-    EXPECT_EQ(handle ? handle->mode : nullptr, mode->mode);
+    EXPECT_EQ(handle, mode);
     EXPECT_EQ(t.device(), c10::Device(c10::kCPU));
     return t;
   };
@@ -407,7 +458,7 @@ TEST(TestNative, InitCppFake) {
   // within a kernel does not mark the shared storage again, but a new fake of
   // it, as the fake fallback makes inside a kernel for a view op's output,
   // does; its fake device is replaced.
-  mode->mode->allow_unsafe_data_ptr_access_ = false;
+  mode->allow_unsafe_data_ptr_access_ = false;
   expect_throws(make_fake());
   expect_warns(fake);
   auto view = at::native::as_strided_tensorimpl(fake, {1}, {1});
@@ -425,7 +476,7 @@ TEST(TestNative, InitCppFake) {
   // A rejected tensor is left unchanged
   auto expect_rejected = [&](const at::Tensor& t,
                              c10::Device device,
-                             const std::shared_ptr<c10::FakeTensorModeHandle>& m,
+                             const std::shared_ptr<c10::FakeTensorMode>& m,
                              const std::string& msg) {
     auto* impl = t.unsafeGetTensorImpl();
     try {
