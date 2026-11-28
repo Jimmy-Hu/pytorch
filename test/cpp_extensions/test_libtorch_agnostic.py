@@ -709,6 +709,148 @@ class TestLibtorchAgnostic(TestCase):
         with self.assertRaisesRegex(RuntimeError, "Not yet supported DeviceType"):
             libtorch_agnostic._interop.device_roundtrip(torch.device("xla"))
 
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    @parametrize(
+        "layout",
+        [
+            torch.strided,
+            torch.sparse_coo,
+            torch.sparse_csr,
+            torch.sparse_csc,
+            torch.sparse_bsr,
+            torch.sparse_bsc,
+            torch._mkldnn,
+            torch.jagged,
+        ],
+        name_fn=lambda layout: str(layout).removeprefix("torch."),
+    )
+    def test_pyobject_layout_roundtrip(self, device, layout):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        # torch.layout objects are singletons.
+        self.assertIs(libtorch_agnostic._interop.layout_roundtrip(layout), layout)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    @parametrize(
+        "layout",
+        [torch.strided, torch.sparse_coo],
+        name_fn=lambda layout: str(layout).removeprefix("torch."),
+    )
+    def test_pyobject_tensor_layout(self, device, layout):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        tensor = torch.randn(2, 3, device=device)
+        if layout == torch.sparse_coo:
+            tensor = tensor.to_sparse()
+        self.assertIs(libtorch_agnostic._interop.tensor_layout(tensor), layout)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    def test_pyobject_non_layout_raises(self, device):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        with self.assertRaisesRegex(RuntimeError, "expected torch.layout"):
+            libtorch_agnostic._interop.layout_roundtrip(torch.float32)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    @parametrize(
+        "memory_format",
+        [
+            torch.contiguous_format,
+            torch.preserve_format,
+            torch.channels_last,
+            torch.channels_last_3d,
+        ],
+        name_fn=lambda memory_format: str(memory_format).removeprefix("torch."),
+    )
+    def test_pyobject_memory_format_roundtrip(self, device, memory_format):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        out = libtorch_agnostic._interop.memory_format_roundtrip(memory_format)
+        # torch.memory_format objects are singletons.
+        self.assertIs(out, memory_format)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    def test_pyobject_non_memory_format_raises(self, device):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        with self.assertRaisesRegex(RuntimeError, "expected torch.memory_format"):
+            libtorch_agnostic._interop.memory_format_roundtrip(torch.strided)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    def test_pyobject_bool_roundtrip(self, device):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        roundtrip = libtorch_agnostic._interop.bool_roundtrip
+        self.assertIs(roundtrip(True), True)
+        self.assertIs(roundtrip(False), False)
+        # No truthiness: only the bool singletons are accepted.
+        for value in (1, 0, None, "True"):
+            with self.assertRaisesRegex(RuntimeError, "expected bool"):
+                roundtrip(value)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    @parametrize("value", [0, -1, 2**63 - 1, -(2**63)])
+    def test_pyobject_int64_roundtrip(self, device, value):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        out = libtorch_agnostic._interop.int64_roundtrip(value)
+        self.assertIs(type(out), int)
+        self.assertEqual(out, value)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    def test_pyobject_int64_rejects(self, device):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        roundtrip = libtorch_agnostic._interop.int64_roundtrip
+        # bool is an int subclass but is rejected; floats are not truncated.
+        for value in (True, 1.0):
+            with self.assertRaisesRegex(RuntimeError, "expected int"):
+                roundtrip(value)
+        for value in (2**63, -(2**63) - 1):
+            with self.assertRaisesRegex(RuntimeError, "Overflow"):
+                roundtrip(value)
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    @parametrize("value", [1.5, -0.0, math.inf, -math.inf, math.nan, 3, 1e300])
+    def test_pyobject_double_roundtrip(self, device, value):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        out = libtorch_agnostic._interop.double_roundtrip(value)
+        self.assertIs(type(out), float)
+        self.assertEqual(out, float(value))
+        self.assertEqual(math.copysign(1.0, out), math.copysign(1.0, value))
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    def test_pyobject_double_error_message(self, device):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        self.assertIn(
+            "int too large to convert to float",
+            libtorch_agnostic._interop.double_error_message(10**400),
+        )
+
+    @onlyCPU
+    @skipIfTorchVersionLessThan(2, 16)
+    def test_pyobject_double_rejects(self, device):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        roundtrip = libtorch_agnostic._interop.double_roundtrip
+        with self.assertRaisesRegex(RuntimeError, "expected float"):
+            roundtrip("1.0")
+        # CPython raises here; its exception is left set and propagates as is.
+        with self.assertRaisesRegex(OverflowError, "int too large to convert to float"):
+            roundtrip(10**400)
+
     @skipIfTorchVersionLessThan(2, 16)
     @skipIfTorchDynamo("Dynamo failed to run FX node with fake tensors")
     def test_my_add(self, device):
@@ -1144,7 +1286,7 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(result[1], t2 * t2)
 
     @skipIfTorchVersionLessThan(2, 10)
-    @onlyCUDA
+    @onlyCPU
     def test_device(self, device):
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1196,6 +1338,14 @@ class TestLibtorchAgnostic(TestCase):
             RuntimeError, "Device index 129 is out of range for int8_t"
         ):
             libtorch_agnostic.ops.test_device_set_index(cuda_device, 129)
+
+        if not _torchVersionLessThan(2, 16):
+            import libtorch_agn_2_16
+
+            self.assertEqual(
+                libtorch_agn_2_16.ops.test_device_set_index(torch.device("mtia"), 1),
+                torch.device("mtia:1"),
+            )
 
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
